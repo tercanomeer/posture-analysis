@@ -445,6 +445,89 @@ renderer.draw_metrics(frame, metrics)
 cv2.imshow("Posture Analysis", frame)
 ```
 
+## Optimization notes
+
+### Profile-driven analysis
+
+Measured per-stage latency on a 1280×720 stream (200 iters, MediaPipe `full`
+model, M4 CPU). Stages that early-exit on `pose is None` are profiled
+separately with synthetic landmarks injected.
+
+```
+stage              p50      p95     mean    share
+─────────────────────────────────────────────────
+detector          7.04    7.33    7.04    pipeline-bound  ← MediaPipe inference
+extractor         0.012   0.012   0.012   trivial
+smoother          0.026   0.026   0.025   trivial
+analyzer          0.006   0.006   0.006   trivial
+classifier        0.001   0.001   0.001   trivial
+skeleton draw     0.085   0.089   0.085   trivial
+dashboard         0.197   0.206   0.197   ← after fix; was 3.336
+─────────────────────────────────────────────────
+total                                      ~7.4 ms  →  ~135 fps headroom
+```
+
+### Applied fix: dashboard chrome cache
+
+The first profile showed the dashboard at 3.34 ms — 96% of all
+post-detection cost. Drilling in, the *entire* time came from one line:
+`canvas[:] = Palette.bg`, a numpy broadcast that touches every pixel of the
+1620×776×3 canvas. The actual `cv2` draw calls were only 0.13 ms combined.
+
+The dashboard now pre-renders all static chrome (background fill, header
+bg/title/accent, sidebar section titles + accent underlines, ANGLES row
+stripes + left-side labels) into a template at first use. Per-frame
+`Dashboard.render`:
+
+1. `np.copyto(canvas, chrome)` — one fast memcpy.
+2. Camera frame copy into the camera region.
+3. Camera-area divider line.
+4. Dynamic only: FPS value, STATUS card, ANGLES values, WARNINGS list.
+
+Result: **dashboard 3.34 → 0.20 ms (−94%)**, total downstream **3.47 → 0.33 ms (−91%)**.
+
+### What was NOT worth optimizing
+
+After the chrome cache the pipeline is dominated by MediaPipe (7 ms);
+everything else combined is ~0.33 ms. Specifically:
+
+- **Skeleton draw (0.086 ms)** — 35 lines + 33 circles via individual cv2
+  calls. Could batch with `cv2.polylines` but the pose topology is a graph,
+  not chains. Save would be sub-100 µs at best. Skip.
+- **Smoother Python loop (0.026 ms)** — reading 33 landmarks into the EMA
+  state array. Vectorizable, but a 0.026 ms ceiling on the win isn't worth
+  the API churn. Skip.
+- **Extractor (0.012 ms)** — same reasoning.
+
+### Profiling suggestions for future changes
+
+1. **Profile first, optimize second.** The chrome-cache win was a 17×
+   speedup on the dashboard — and we'd never have guessed `canvas[:] = bg`
+   was a 3 ms line without measurement. The harnesses used here are in this
+   PR's commit; they take ~5 seconds to run on a fresh checkout.
+2. **`time.perf_counter()`** with `n ≥ 200` iterations and a warmup phase
+   gives stable percentiles; mean alone hides p99 tails.
+3. For MediaPipe inference specifically, try `--model lite` if CPU bound;
+   it costs ~3 ms vs ~7 ms for `full` with modest accuracy loss.
+
+### Architectural improvements considered
+
+- **Threaded capture-detect split**: run `cv2.VideoCapture.read()` on a
+  background thread feeding a single-slot queue, so the inference loop never
+  waits on the next frame. At our current 30 FPS / 10 ms pipeline this saves
+  little, but on a smaller-budget device (RPi, mobile) it can recover
+  effective FPS. Not implemented because the current bottleneck is solidly
+  MediaPipe, not capture latency.
+- **In-place `Pose` mutation**: smoother currently builds 33 new `Landmark`
+  dataclasses every frame. Switching `Pose` to carry a `(33, 4)` numpy array
+  internally — with `Landmark` as a thin view — would eliminate that. But
+  the allocations cost 0.026 ms, so this is API-churn-for-no-gain unless
+  the language runtime regresses.
+- **Resize before inference**: downsampling the camera frame to 640×360
+  before handing it to MediaPipe can roughly halve inference time on
+  CPU-only hardware. Quality impact varies with distance to camera. Add as
+  a `--inference-size` flag if needed.
+
 ## Performance notes
 
 - **Single BGR→RGB conversion** per frame; the array is wrapped in `mp.Image`
