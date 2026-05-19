@@ -10,6 +10,7 @@ from src.biomechanics import PostureAnalyzer, PostureMetrics
 from src.camera import Webcam
 from src.classifier import PostureAssessment, PostureClassifier
 from src.detector import PoseDetector
+from src.feedback import FeedbackRenderer
 from src.fps import FPSCounter
 from src.landmarks import LandmarkExtractor
 from src.models import MODEL_URLS, ensure_pose_model
@@ -76,6 +77,7 @@ def main() -> int:
     analyzer = PostureAnalyzer()
     classifier = PostureClassifier()
     renderer = PoseRenderer()
+    feedback = FeedbackRenderer()
 
     with Webcam(source=source, width=args.width, height=args.height) as cam, \
             PoseDetector(model_path=str(model_path)) as detector:
@@ -90,9 +92,9 @@ def main() -> int:
             current_fps = fps.tick()
 
             renderer.draw_skeleton(frame, pose)
+            feedback.draw(frame, assessment)
             renderer.draw_fps(frame, current_fps)
             renderer.draw_metrics(frame, metrics)
-            renderer.draw_assessment(frame, assessment)
             _print_status(metrics, assessment, current_fps)
 
             cv2.imshow(WINDOW_NAME, frame)

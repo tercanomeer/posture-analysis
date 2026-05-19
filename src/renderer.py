@@ -7,23 +7,18 @@ import cv2
 import numpy as np
 
 from .biomechanics import PostureMetrics
-from .classifier import PostureAssessment, Severity
 from .landmarks import POSE_CONNECTIONS, Pose
 
 Color = Tuple[int, int, int]
 
-_SEVERITY_COLORS: dict[Severity, Color] = {
-    Severity.OK: (0, 200, 0),
-    Severity.MILD: (0, 200, 220),
-    Severity.SEVERE: (0, 64, 220),
-    Severity.UNKNOWN: (160, 160, 160),
-}
-
 
 class PoseRenderer:
-    """Draws a ``Pose`` skeleton and HUD elements onto frames in place.
+    """Draws a ``Pose`` skeleton and the FPS/metrics HUD onto frames in place.
 
-    Independent of MediaPipe — depends only on the ``landmarks`` module.
+    Depends only on the ``landmarks`` and ``biomechanics`` modules — never
+    imports MediaPipe directly. Posture-feedback visuals (border, banner,
+    warnings) live in ``FeedbackRenderer`` so this class stays focused on
+    geometric/numeric overlays.
     """
 
     def __init__(
@@ -34,6 +29,7 @@ class PoseRenderer:
         connection_thickness: int = 2,
         visibility_threshold: float = 0.5,
         hud_color: Color = (0, 255, 0),
+        hud_top: int = 80,  # leave room for FeedbackRenderer's banner.
     ) -> None:
         self._landmark_color = landmark_color
         self._connection_color = connection_color
@@ -41,11 +37,12 @@ class PoseRenderer:
         self._connection_thickness = connection_thickness
         self._visibility_threshold = visibility_threshold
         self._hud_color = hud_color
+        self._hud_top = hud_top
 
     def draw_skeleton(self, frame: np.ndarray, pose: Optional[Pose]) -> np.ndarray:
         if pose is None:
             return frame
-        points = pose.pixels  # cached projection
+        points = pose.pixels
         landmarks = pose.landmarks
         threshold = self._visibility_threshold
 
@@ -73,7 +70,7 @@ class PoseRenderer:
         return frame
 
     def draw_fps(self, frame: np.ndarray, fps: float) -> np.ndarray:
-        return self._draw_hud_text(frame, f"FPS: {fps:5.1f}", origin=(12, 32))
+        return self._draw_hud_text(frame, f"FPS: {fps:5.1f}", origin=(12, self._hud_top))
 
     def draw_metrics(self, frame: np.ndarray, metrics: PostureMetrics) -> np.ndarray:
         lines = (
@@ -82,19 +79,9 @@ class PoseRenderer:
             f"Torso:    {self._fmt(metrics.torso_inclination)}",
         )
         for i, line in enumerate(lines):
-            self._draw_hud_text(frame, line, origin=(12, 64 + i * 28), scale=0.65)
-        return frame
-
-    def draw_assessment(self, frame: np.ndarray, assessment: PostureAssessment) -> np.ndarray:
-        h = frame.shape[0]
-        color = _SEVERITY_COLORS.get(assessment.overall, self._hud_color)
-        self._draw_hud_text(
-            frame,
-            f"Posture: {assessment.label}",
-            origin=(12, h - 16),
-            scale=0.7,
-            color=color,
-        )
+            self._draw_hud_text(
+                frame, line, origin=(12, self._hud_top + 32 + i * 28), scale=0.65
+            )
         return frame
 
     @staticmethod

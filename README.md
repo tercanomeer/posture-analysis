@@ -23,7 +23,8 @@ posture-analysis/
     ├── landmarks.py     # PoseLandmark enum, Landmark, Pose, LandmarkExtractor, POSE_CONNECTIONS
     ├── biomechanics.py  # angle_between primitive + neck/shoulder/torso analyzers
     ├── classifier.py    # Rule-based posture classifier (FHP, asymmetry, slouch)
-    ├── renderer.py      # PoseRenderer — skeleton overlay + FPS/metrics/verdict HUD
+    ├── renderer.py      # PoseRenderer — skeleton overlay + FPS/metrics HUD
+    ├── feedback.py      # FeedbackRenderer — colored border, status banner, warning chips
     ├── fps.py           # FPSCounter — EMA-smoothed frame rate
     └── models.py        # ensure_pose_model — auto-downloads .task files
 ```
@@ -70,10 +71,12 @@ The pipeline is split into single-responsibility stages so each piece is
 independently testable, replaceable, and reusable.
 
 ```
-  Webcam ─► Detector ─► LandmarkExtractor ─► PostureAnalyzer ─► PostureClassifier ─► Renderer ─► imshow
-   (BGR)     (Raw)        (Pose)               (Metrics)          (Assessment)         ▲
-                              │                                                        │
-                              └───────────────────── Pose ─────────────────────────────┘
+  Webcam ─► Detector ─► LandmarkExtractor ─► PostureAnalyzer ─► PostureClassifier ─► PoseRenderer + FeedbackRenderer ─► imshow
+   (BGR)     (Raw)        (Pose)               (Metrics)          (Assessment)            ▲                ▲
+                              │                                                            │                │
+                              └────────────────────── Pose ───────────────────────────────┘                │
+                                                                                                            │
+                                          Assessment ──────────────────────────────────────────────────────┘
 ```
 
 The key architectural rule: **MediaPipe lives behind the detector/extractor
@@ -178,12 +181,27 @@ shoulder labels swapped) is correctly treated as a level shoulder line, not a
 severe asymmetry.
 
 ### `src/renderer.py` — `PoseRenderer`
-Stateless drawing of skeleton + HUD onto frames *in place*. Imports only from
-`landmarks.py` and `biomechanics.py`. Uses the cached `pose.pixels` projection
-and visibility-gates both edges and joints. HUD text is rendered twice (black
-stroke, then colored fill) for legibility on bright backgrounds.
-`draw_metrics(frame, metrics)` formats each posture value as
-`"Neck:  162.3 deg"` and prints `--` for NaN entries.
+Stateless drawing of skeleton + numeric HUD onto frames *in place*. Imports
+only from `landmarks.py` and `biomechanics.py`. Uses the cached `pose.pixels`
+projection and visibility-gates both edges and joints. HUD text is rendered
+twice (black stroke, then colored fill) for legibility on bright backgrounds.
+`draw_fps` and `draw_metrics` deliberately position below `hud_top` (default
+80px) so they sit beneath `FeedbackRenderer`'s status banner.
+
+### `src/feedback.py` — `FeedbackRenderer`
+Real-time visual feedback driven by a `PostureAssessment`. Three components,
+all severity-colored:
+
+- **Border** — a thick rectangle hugging the frame edges. Green for OK, amber
+  for MILD, red for SEVERE, grey for UNKNOWN.
+- **Status banner** — a solid colored bar across the top displaying
+  `POSTURE: GOOD` / `ADJUST` / `WARNING` / `NO DETECTION`.
+- **Warning chips** — for each MILD/SEVERE finding, a filled colored chip in
+  the bottom-right reads `WARNING: <issue> (<severity>)`.
+
+Everything is plain `cv2.rectangle` / `cv2.putText` — no alpha blending, no
+per-pixel work, no allocations beyond what OpenCV does internally. Cheap
+enough to call every frame in a realtime loop.
 
 ### `src/fps.py` — `FPSCounter`
 Exponential-moving-average frame-rate estimator over `time.perf_counter()`
@@ -308,8 +326,33 @@ custom = PostureClassifier(rules=[
 | 140 / 12 / 25 | SEVERE | `Forward head (severe); Shoulder asymmetry (severe); Slouching (severe)` |
 | NaN / NaN / NaN | UNKNOWN | `No detection` |
 
-In the live HUD the assessment label is rendered at the bottom of the frame,
-color-coded by severity (green / amber / red / grey).
+In the live HUD the assessment drives a full-frame visual feedback overlay —
+a severity-colored border, a top status banner, and one warning chip per
+mild/severe finding. See `src/feedback.py`.
+
+## Integration: building a feedback-aware loop
+
+```python
+from src.feedback import FeedbackRenderer
+# ... plus the other modules
+
+feedback = FeedbackRenderer()      # defaults are sized for a 1280x720 stream
+
+# Per frame:
+renderer.draw_skeleton(frame, pose)
+feedback.draw(frame, assessment)   # draws *over* skeleton: banner, border, chips
+renderer.draw_fps(frame, fps_value)
+renderer.draw_metrics(frame, metrics)
+```
+
+The draw order matters:
+
+1. **Skeleton first** — the feedback border slightly crops the outermost few
+   pixels, and the banner masks the top strip.
+2. **Feedback second** — its banner sits above the FPS/metrics origins so
+   the text doesn't overlap.
+3. **FPS / metrics last** — drawn below the banner, on top of any feedback
+   inside the frame interior.
 
 ## Performance notes
 
