@@ -24,8 +24,9 @@ posture-analysis/
     ├── smoother.py      # LandmarkSmoother — per-coordinate EMA on Pose, jitter reduction
     ├── biomechanics.py  # angle_between primitive + neck/shoulder/torso analyzers
     ├── classifier.py    # Rule-based posture classifier (FHP, asymmetry, slouch)
-    ├── renderer.py      # PoseRenderer — skeleton overlay + FPS/metrics HUD
-    ├── feedback.py      # FeedbackRenderer — colored border, status banner, warning chips
+    ├── renderer.py      # PoseRenderer — skeleton overlay (also has FPS/metrics HUD methods)
+    ├── feedback.py      # FeedbackRenderer — full-frame overlay alternative (border + banner + chips)
+    ├── dashboard.py     # Dashboard — composed academic-style UI (header + camera + sidebar)
     ├── fps.py           # FPSCounter — EMA-smoothed frame rate
     └── models.py        # ensure_pose_model — auto-downloads .task files
 ```
@@ -74,12 +75,10 @@ The pipeline is split into single-responsibility stages so each piece is
 independently testable, replaceable, and reusable.
 
 ```
-  Webcam ─► Detector ─► LandmarkExtractor ─► LandmarkSmoother ─► PostureAnalyzer ─► PostureClassifier ─► PoseRenderer + FeedbackRenderer ─► imshow
-   (BGR)     (Raw)        (Pose)               (Pose, smoothed)    (Metrics)          (Assessment)            ▲                ▲
-                                                       │                                                       │                │
-                                                       └─────────────────────────────────── Pose ─────────────┘                │
-                                                                                                                                │
-                                                          Assessment ────────────────────────────────────────────────────────────┘
+  Webcam ─► Detector ─► LandmarkExtractor ─► LandmarkSmoother ─► PostureAnalyzer ─► PostureClassifier ─► PoseRenderer.draw_skeleton ─► Dashboard.render ─► imshow
+   (BGR)     (Raw)        (Pose)               (Pose, smoothed)    (Metrics)          (Assessment)             (camera frame, in place)        ▲
+                                                                                                                                                 │
+                                                                                       (metrics, assessment, fps) ──────────────────────────────┘
 ```
 
 The key architectural rule: **MediaPipe lives behind the detector/extractor
@@ -218,19 +217,47 @@ twice (black stroke, then colored fill) for legibility on bright backgrounds.
 80px) so they sit beneath `FeedbackRenderer`'s status banner.
 
 ### `src/feedback.py` — `FeedbackRenderer`
-Real-time visual feedback driven by a `PostureAssessment`. Three components,
-all severity-colored:
+Full-frame overlay alternative used when you want a single, undivided camera
+view. Three severity-colored components: a thick border around the frame, a
+status banner across the top, and warning chips stacked bottom-right. All
+draws are plain `cv2.rectangle` / `cv2.putText` — no alpha blending. Use
+this instead of `Dashboard` for fullscreen presentations where the camera
+should fill the whole window.
 
-- **Border** — a thick rectangle hugging the frame edges. Green for OK, amber
-  for MILD, red for SEVERE, grey for UNKNOWN.
-- **Status banner** — a solid colored bar across the top displaying
-  `POSTURE: GOOD` / `ADJUST` / `WARNING` / `NO DETECTION`.
-- **Warning chips** — for each MILD/SEVERE finding, a filled colored chip in
-  the bottom-right reads `WARNING: <issue> (<severity>)`.
+### `src/dashboard.py` — `Dashboard`
+The default UI for the live demo: a composed academic-style layout assembled
+on a pre-allocated canvas.
 
-Everything is plain `cv2.rectangle` / `cv2.putText` — no alpha blending, no
-per-pixel work, no allocations beyond what OpenCV does internally. Cheap
-enough to call every frame in a realtime loop.
+```
+┌─────────────────────────────────────────────────────────┐
+│ Posture Analysis  |  Realtime Demo         FPS  29.7    │ ← Header strip (56 px)
+├─────────────────────────────────────────┬───────────────┤
+│                                         │ STATUS        │
+│                                         │ ┌───────────┐ │
+│           camera feed +                 │ │POSTURE:   │ │ ← severity-colored card
+│           skeleton overlay              │ │  GOOD     │ │
+│                                         │ └───────────┘ │
+│                                         │ ANGLES        │
+│                                         │  Neck   178.0°│ ← striped rows
+│                                         │  Shoul.   1.0°│
+│                                         │  Torso    2.0°│
+│                                         │ WARNINGS      │
+│                                         │  • Forward …  │
+└─────────────────────────────────────────┴───────────────┘
+```
+
+Layout: a 56-px header strip with title + FPS, the raw camera frame copied
+into the left area (with skeleton already drawn on it by `PoseRenderer`),
+and a 340-px sidebar on the right with three sectioned panels — `STATUS`,
+`ANGLES`, `WARNINGS`. Each section title is underlined with the gold accent.
+
+Performance: the canvas is allocated once and reused; per-frame work is
+one `np.ndarray` solid fill + one memcpy of the camera area + a handful of
+`cv2.rectangle` / `cv2.putText` / `cv2.line` / `cv2.circle` calls.
+Benchmarked at **3.3 ms / frame** on a 1280×720 stream (~300 fps headroom).
+
+Both `sidebar_width`, `header_height`, and `title` are constructor args so a
+thesis demo can swap in the speaker's preferred wording.
 
 ### `src/fps.py` — `FPSCounter`
 Exponential-moving-average frame-rate estimator over `time.perf_counter()`
@@ -378,33 +405,45 @@ custom = PostureClassifier(rules=[
 | 140 / 12 / 25 | SEVERE | `Forward head (severe); Shoulder asymmetry (severe); Slouching (severe)` |
 | NaN / NaN / NaN | UNKNOWN | `No detection` |
 
-In the live HUD the assessment drives a full-frame visual feedback overlay —
-a severity-colored border, a top status banner, and one warning chip per
-mild/severe finding. See `src/feedback.py`.
+By default the live demo uses `Dashboard` (composed sidebar UI). For a
+fullscreen-camera presentation, swap in `FeedbackRenderer` instead — its
+border + banner + chips sit directly on the frame.
 
-## Integration: building a feedback-aware loop
+## Integration: building a dashboard-aware loop
+
+```python
+from src.dashboard import Dashboard
+
+dashboard = Dashboard(title="My Thesis Demo")  # sidebar/header sizes also configurable
+
+# Per frame:
+renderer.draw_skeleton(frame, pose)            # mutates the camera frame in place
+canvas = dashboard.render(frame, metrics, assessment, current_fps)
+cv2.imshow("Posture Analysis", canvas)
+```
+
+The draw order is fixed:
+
+1. **Skeleton first** — drawn into the raw camera frame so it appears
+   inside the dashboard's camera area.
+2. **Dashboard second** — composites the frame plus all panels onto its
+   pre-allocated canvas in a single `render()` call.
+
+### Alternative: fullscreen overlay
+
+If you'd rather present the camera at full window size, replace `Dashboard`
+with `FeedbackRenderer`:
 
 ```python
 from src.feedback import FeedbackRenderer
-# ... plus the other modules
-
-feedback = FeedbackRenderer()      # defaults are sized for a 1280x720 stream
-
-# Per frame:
+feedback = FeedbackRenderer()
+# ...
 renderer.draw_skeleton(frame, pose)
-feedback.draw(frame, assessment)   # draws *over* skeleton: banner, border, chips
-renderer.draw_fps(frame, fps_value)
+feedback.draw(frame, assessment)
+renderer.draw_fps(frame, current_fps)
 renderer.draw_metrics(frame, metrics)
+cv2.imshow("Posture Analysis", frame)
 ```
-
-The draw order matters:
-
-1. **Skeleton first** — the feedback border slightly crops the outermost few
-   pixels, and the banner masks the top strip.
-2. **Feedback second** — its banner sits above the FPS/metrics origins so
-   the text doesn't overlap.
-3. **FPS / metrics last** — drawn below the banner, on top of any feedback
-   inside the frame interior.
 
 ## Performance notes
 

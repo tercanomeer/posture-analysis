@@ -9,8 +9,8 @@ import cv2
 from src.biomechanics import PostureAnalyzer, PostureMetrics
 from src.camera import Webcam
 from src.classifier import PostureAssessment, PostureClassifier
+from src.dashboard import Dashboard
 from src.detector import PoseDetector
-from src.feedback import FeedbackRenderer
 from src.fps import FPSCounter
 from src.landmarks import LandmarkExtractor
 from src.models import MODEL_URLS, ensure_pose_model
@@ -97,7 +97,7 @@ def main() -> int:
     analyzer = PostureAnalyzer()
     classifier = PostureClassifier()
     renderer = PoseRenderer()
-    feedback = FeedbackRenderer()
+    dashboard = Dashboard()
 
     with Webcam(source=source, width=args.width, height=args.height) as cam, \
             PoseDetector(model_path=str(model_path)) as detector:
@@ -113,12 +113,10 @@ def main() -> int:
             current_fps = fps.tick()
 
             renderer.draw_skeleton(frame, pose)
-            feedback.draw(frame, assessment)
-            renderer.draw_fps(frame, current_fps)
-            renderer.draw_metrics(frame, metrics)
+            canvas = dashboard.render(frame, metrics, assessment, current_fps)
             _print_status(metrics, assessment, current_fps)
 
-            cv2.imshow(WINDOW_NAME, frame)
+            cv2.imshow(WINDOW_NAME, canvas)
             if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
                 break
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
