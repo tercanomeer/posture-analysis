@@ -8,6 +8,7 @@ import cv2
 
 from src.biomechanics import PostureAnalyzer, PostureMetrics
 from src.camera import Webcam
+from src.classifier import PostureAssessment, PostureClassifier
 from src.detector import PoseDetector
 from src.fps import FPSCounter
 from src.landmarks import LandmarkExtractor
@@ -49,12 +50,13 @@ def _fmt_deg(v: float) -> str:
     return "   -- " if math.isnan(v) else f"{v:6.1f}"
 
 
-def _print_metrics(metrics: PostureMetrics, fps: float) -> None:
+def _print_status(metrics: PostureMetrics, assessment: PostureAssessment, fps: float) -> None:
     line = (
         f"\rNeck: {_fmt_deg(metrics.neck_angle)}°  "
         f"Shoulder: {_fmt_deg(metrics.shoulder_slope)}°  "
         f"Torso: {_fmt_deg(metrics.torso_inclination)}°  "
-        f"FPS: {fps:5.1f}"
+        f"FPS: {fps:5.1f}  "
+        f"| {assessment.overall.value.upper():7s} {assessment.label:<40s}"
     )
     # \r so an interactive terminal sees one self-updating line; flush so
     # consumers reading the pipe (e.g. background tasks) see each tick promptly.
@@ -72,6 +74,7 @@ def main() -> int:
     fps = FPSCounter()
     extractor = LandmarkExtractor()
     analyzer = PostureAnalyzer()
+    classifier = PostureClassifier()
     renderer = PoseRenderer()
 
     with Webcam(source=source, width=args.width, height=args.height) as cam, \
@@ -83,12 +86,14 @@ def main() -> int:
             raw = detector.detect(frame)
             pose = extractor.extract(raw.landmarks, raw.image_size)
             metrics = analyzer.analyze(pose)
+            assessment = classifier.classify(metrics)
             current_fps = fps.tick()
 
             renderer.draw_skeleton(frame, pose)
             renderer.draw_fps(frame, current_fps)
             renderer.draw_metrics(frame, metrics)
-            _print_metrics(metrics, current_fps)
+            renderer.draw_assessment(frame, assessment)
+            _print_status(metrics, assessment, current_fps)
 
             cv2.imshow(WINDOW_NAME, frame)
             if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:

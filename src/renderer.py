@@ -7,9 +7,17 @@ import cv2
 import numpy as np
 
 from .biomechanics import PostureMetrics
+from .classifier import PostureAssessment, Severity
 from .landmarks import POSE_CONNECTIONS, Pose
 
 Color = Tuple[int, int, int]
+
+_SEVERITY_COLORS: dict[Severity, Color] = {
+    Severity.OK: (0, 200, 0),
+    Severity.MILD: (0, 200, 220),
+    Severity.SEVERE: (0, 64, 220),
+    Severity.UNKNOWN: (160, 160, 160),
+}
 
 
 class PoseRenderer:
@@ -77,6 +85,18 @@ class PoseRenderer:
             self._draw_hud_text(frame, line, origin=(12, 64 + i * 28), scale=0.65)
         return frame
 
+    def draw_assessment(self, frame: np.ndarray, assessment: PostureAssessment) -> np.ndarray:
+        h = frame.shape[0]
+        color = _SEVERITY_COLORS.get(assessment.overall, self._hud_color)
+        self._draw_hud_text(
+            frame,
+            f"Posture: {assessment.label}",
+            origin=(12, h - 16),
+            scale=0.7,
+            color=color,
+        )
+        return frame
+
     @staticmethod
     def _fmt(value: float) -> str:
         return "  --" if math.isnan(value) else f"{value:6.1f} deg"
@@ -87,9 +107,11 @@ class PoseRenderer:
         text: str,
         origin: Tuple[int, int],
         scale: float = 0.8,
+        color: Optional[Color] = None,
     ) -> np.ndarray:
         font = cv2.FONT_HERSHEY_SIMPLEX
+        fill = color if color is not None else self._hud_color
         # Black outline first for legibility on bright backgrounds.
         cv2.putText(frame, text, origin, font, scale, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, text, origin, font, scale, self._hud_color, 2, cv2.LINE_AA)
+        cv2.putText(frame, text, origin, font, scale, fill, 2, cv2.LINE_AA)
         return frame

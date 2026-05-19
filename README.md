@@ -3,8 +3,9 @@
 Real-time human pose detection from a webcam feed, built on MediaPipe + OpenCV.
 Produces structured, framework-agnostic landmark objects (with optional
 body-relative normalization), runs a biomechanics analysis engine on them
-(neck angle, shoulder slope, torso inclination), and renders a skeleton
-overlay with a live FPS + metrics HUD.
+(neck angle, shoulder slope, torso inclination), classifies the result against
+configurable thresholds (forward head, shoulder asymmetry, slouching), and
+renders a skeleton overlay with a live FPS + metrics + verdict HUD.
 
 ## File structure
 
@@ -21,7 +22,8 @@ posture-analysis/
     ├── detector.py      # PoseDetector — MediaPipe Tasks PoseLandmarker wrapper
     ├── landmarks.py     # PoseLandmark enum, Landmark, Pose, LandmarkExtractor, POSE_CONNECTIONS
     ├── biomechanics.py  # angle_between primitive + neck/shoulder/torso analyzers
-    ├── renderer.py      # PoseRenderer — skeleton overlay + FPS/metrics HUD (MediaPipe-free)
+    ├── classifier.py    # Rule-based posture classifier (FHP, asymmetry, slouch)
+    ├── renderer.py      # PoseRenderer — skeleton overlay + FPS/metrics/verdict HUD
     ├── fps.py           # FPSCounter — EMA-smoothed frame rate
     └── models.py        # ensure_pose_model — auto-downloads .task files
 ```
@@ -68,11 +70,10 @@ The pipeline is split into single-responsibility stages so each piece is
 independently testable, replaceable, and reusable.
 
 ```
-   ┌────────┐ BGR  ┌──────────┐ Raw  ┌──────────────────┐ Pose  ┌──────────────────┐ Metrics  ┌──────────┐
-   │ Webcam │ ───► │ Detector │ ───► │ LandmarkExtractor│ ────► │ PostureAnalyzer  │ ───────► │ Renderer │ ──► imshow
-   └────────┘      └──────────┘      └──────────────────┘   │   └──────────────────┘          └──────────┘
-                                                            │                                       ▲
-                                                            └───────────────── Pose ────────────────┘
+  Webcam ─► Detector ─► LandmarkExtractor ─► PostureAnalyzer ─► PostureClassifier ─► Renderer ─► imshow
+   (BGR)     (Raw)        (Pose)               (Metrics)          (Assessment)         ▲
+                              │                                                        │
+                              └───────────────────── Pose ─────────────────────────────┘
 ```
 
 The key architectural rule: **MediaPipe lives behind the detector/extractor
@@ -140,6 +141,41 @@ Two layers, both reusable on their own.
 frozen dataclass with all three metrics. Any field is `math.nan` whenever the
 required landmarks fall below the visibility threshold or `pose is None`, so
 the realtime loop never crashes on partially-occluded subjects.
+
+### `src/classifier.py` — rule-based posture classification
+Consumes a `PostureMetrics` and emits a `PostureAssessment` with a readable
+label. Designed to be lightweight (O(1) per rule, no allocations per call)
+and pluggable.
+
+- **`Severity`** — `OK` / `MILD` / `SEVERE` / `UNKNOWN`. `UNKNOWN` is returned
+  when the input metric is NaN (occluded landmarks), so callers can distinguish
+  "no data" from "good posture".
+- **`PostureThresholds`** — frozen dataclass exposing every tunable knob:
+
+  | Field | Default | Meaning |
+  | --- | ---: | --- |
+  | `forward_head_mild_deg` | `160.0` | neck angle below this → mild forward head |
+  | `forward_head_severe_deg` | `145.0` | neck angle below this → severe forward head |
+  | `shoulder_mild_deg` | `5.0` | shoulder slope magnitude above this → mild asymmetry |
+  | `shoulder_severe_deg` | `10.0` | shoulder slope magnitude above this → severe asymmetry |
+  | `slouch_mild_deg` | `10.0` | torso inclination magnitude above this → mild slouch |
+  | `slouch_severe_deg` | `20.0` | torso inclination magnitude above this → severe slouch |
+
+- **`PostureRule`** — base class with a single `evaluate(metrics) → Severity`
+  method. Three concrete rules ship with the engine: `ForwardHeadRule`,
+  `ShoulderAsymmetryRule`, `SlouchingRule`.
+- **`PostureClassifier`** — composes rules into an assessment. The default
+  constructor wires up the three built-in rules from a `PostureThresholds`
+  instance; you can also pass your own rule list to extend or replace them.
+- **`PostureAssessment`** — frozen dataclass with `findings` (tuple of
+  `(rule_label, severity)`), `.overall` (worst severity across rules), and
+  `.label` (human-readable summary like
+  `"Forward head (severe); Slouching (mild)"`).
+
+The `ShoulderAsymmetryRule` folds slopes into `[-90°, +90°]` before comparing
+magnitudes, so a mirrored-view artifact reporting `±178°` (LEFT/RIGHT
+shoulder labels swapped) is correctly treated as a level shoulder line, not a
+severe asymmetry.
 
 ### `src/renderer.py` — `PoseRenderer`
 Stateless drawing of skeleton + HUD onto frames *in place*. Imports only from
@@ -226,6 +262,54 @@ print(metrics.neck_angle, metrics.shoulder_slope, metrics.torso_inclination)
 All helpers return `math.nan` when required landmarks fall below the
 visibility threshold or when `pose is None`, so they're safe to call every
 frame without try/except.
+
+## Using the posture classifier
+
+```python
+from src.classifier import PostureClassifier, PostureThresholds, Severity
+
+# Default thresholds:
+classifier = PostureClassifier()
+assessment = classifier.classify(metrics)
+print(assessment.overall.value, "|", assessment.label)
+# → "ok      | Good posture"
+# → "severe  | Forward head (severe); Slouching (mild)"
+# → "unknown | No detection"
+
+# Custom thresholds — pass any subset; the rest stay at defaults:
+strict = PostureClassifier(PostureThresholds(
+    forward_head_mild_deg=170,   # tighter neck tolerance
+    forward_head_severe_deg=160,
+    shoulder_mild_deg=2,
+    shoulder_severe_deg=5,
+))
+strict.classify(metrics)
+
+# Custom rule set — replace or extend the defaults:
+from src.classifier import PostureRule, ForwardHeadRule, ShoulderAsymmetryRule
+
+class HeadTiltRule(PostureRule):
+    name = "head_tilt"; label = "Head tilt"
+    def evaluate(self, metrics):
+        return Severity.OK  # your logic here
+
+custom = PostureClassifier(rules=[
+    ForwardHeadRule(mild_deg=160, severe_deg=145),
+    HeadTiltRule(),
+])
+```
+
+### Example outputs
+
+| Metrics (neck / shoulder / torso, all degrees) | Overall | Label |
+| --- | :---: | --- |
+| 178 / 1 / 2 | OK | `Good posture` |
+| 155 / 3 / 4 | MILD | `Forward head (mild)` |
+| 140 / 12 / 25 | SEVERE | `Forward head (severe); Shoulder asymmetry (severe); Slouching (severe)` |
+| NaN / NaN / NaN | UNKNOWN | `No detection` |
+
+In the live HUD the assessment label is rendered at the bottom of the frame,
+color-coded by severity (green / amber / red / grey).
 
 ## Performance notes
 
