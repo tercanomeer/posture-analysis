@@ -2,8 +2,9 @@
 
 Real-time human pose detection from a webcam feed, built on MediaPipe + OpenCV.
 Produces structured, framework-agnostic landmark objects (with optional
-body-relative normalization) and renders a skeleton overlay with a live FPS
-counter.
+body-relative normalization), runs a biomechanics analysis engine on them
+(neck angle, shoulder slope, torso inclination), and renders a skeleton
+overlay with a live FPS + metrics HUD.
 
 ## File structure
 
@@ -19,7 +20,8 @@ posture-analysis/
     ├── camera.py        # Webcam capture (context-managed, low-latency defaults)
     ├── detector.py      # PoseDetector — MediaPipe Tasks PoseLandmarker wrapper
     ├── landmarks.py     # PoseLandmark enum, Landmark, Pose, LandmarkExtractor, POSE_CONNECTIONS
-    ├── renderer.py      # PoseRenderer — skeleton overlay + HUD (MediaPipe-free)
+    ├── biomechanics.py  # angle_between primitive + neck/shoulder/torso analyzers
+    ├── renderer.py      # PoseRenderer — skeleton overlay + FPS/metrics HUD (MediaPipe-free)
     ├── fps.py           # FPSCounter — EMA-smoothed frame rate
     └── models.py        # ensure_pose_model — auto-downloads .task files
 ```
@@ -66,13 +68,11 @@ The pipeline is split into single-responsibility stages so each piece is
 independently testable, replaceable, and reusable.
 
 ```
-   ┌────────┐  BGR frame   ┌──────────┐  RawPoseResult   ┌──────────────────┐  Pose   ┌────────────┐
-   │ Webcam │ ───────────► │ Detector │ ───────────────► │ LandmarkExtractor│ ──────► │ Renderer   │ ──► imshow
-   └────────┘              └──────────┘                  └──────────────────┘         └────────────┘
-                                                                  │
-                                                                  ▼
-                                                          downstream analytics
-                                                          (e.g. body_normalized())
+   ┌────────┐ BGR  ┌──────────┐ Raw  ┌──────────────────┐ Pose  ┌──────────────────┐ Metrics  ┌──────────┐
+   │ Webcam │ ───► │ Detector │ ───► │ LandmarkExtractor│ ────► │ PostureAnalyzer  │ ───────► │ Renderer │ ──► imshow
+   └────────┘      └──────────┘      └──────────────────┘   │   └──────────────────┘          └──────────┘
+                                                            │                                       ▲
+                                                            └───────────────── Pose ────────────────┘
 ```
 
 The key architectural rule: **MediaPipe lives behind the detector/extractor
@@ -115,11 +115,39 @@ The reusable structured-output layer.
   MediaPipe at module load and re-exported as a plain tuple so consumers
   (renderer, custom overlays) don't need to import MediaPipe.
 
+### `src/biomechanics.py` — geometry primitives + posture analyzer
+Two layers, both reusable on their own.
+
+**Pure-NumPy primitives** (no project dependencies):
+
+- `angle_between(a, b, c)` — angle ∠ABC in degrees at vertex `b`. Accepts any
+  array-like (tuple, list, ndarray) in 2D or 3D. Clamps cosine to `[-1, 1]`
+  before `acos` and returns NaN on degenerate segments — never raises.
+- `angles_batch(triplets)` — vectorized form for `(N, 3, D)` arrays.
+- `signed_angle_from_horizontal(p_from, p_to)` — useful for shoulder slope.
+- `signed_angle_from_vertical(p_from, p_to)` — useful for torso lean.
+
+**Posture-specific helpers** that consume a `Pose`:
+
+- `neck_angle(pose)` — ∠(hip-mid, shoulder-mid, ear-mid). 180° = head stacked
+  above torso (ideal); smaller values indicate forward-head flexion.
+- `shoulder_slope(pose)` — signed angle of the shoulder line from horizontal.
+  Positive = right shoulder higher in the image.
+- `torso_inclination(pose)` — signed angle of hip-mid → shoulder-mid from
+  vertical-up. Positive = leaning right.
+
+**Aggregation**: `PostureAnalyzer.analyze(pose) → PostureMetrics` produces a
+frozen dataclass with all three metrics. Any field is `math.nan` whenever the
+required landmarks fall below the visibility threshold or `pose is None`, so
+the realtime loop never crashes on partially-occluded subjects.
+
 ### `src/renderer.py` — `PoseRenderer`
 Stateless drawing of skeleton + HUD onto frames *in place*. Imports only from
-`landmarks.py`. Uses the cached `pose.pixels` projection and visibility-gates
-both edges and joints. FPS text is rendered twice (black stroke, then colored
-fill) for legibility on bright backgrounds.
+`landmarks.py` and `biomechanics.py`. Uses the cached `pose.pixels` projection
+and visibility-gates both edges and joints. HUD text is rendered twice (black
+stroke, then colored fill) for legibility on bright backgrounds.
+`draw_metrics(frame, metrics)` formats each posture value as
+`"Neck:  162.3 deg"` and prints `--` for NaN entries.
 
 ### `src/fps.py` — `FPSCounter`
 Exponential-moving-average frame-rate estimator over `time.perf_counter()`
@@ -157,6 +185,47 @@ with PoseDetector(model_path=str(ensure_pose_model("full"))) as det:
         # Translation/scale-invariant features for ML or rules-based posture analysis:
         features = pose.body_normalized()
 ```
+
+## Using the biomechanics engine
+
+The `angle_between` primitive is standalone — it works on any 2D/3D points
+and has no project dependencies beyond NumPy:
+
+```python
+from src.biomechanics import angle_between, angles_batch
+
+# Right angle between three 2D points (B is the vertex).
+angle_between((1, 0), (0, 0), (0, 1))   # → 90.0
+
+# Vectorized: shape (N, 3, D) → (N,) angles in degrees.
+import numpy as np
+triplets = np.array([
+    [[1, 0], [0, 0], [0, 1]],
+    [[1, 0, 0], [0, 0, 0], [-1, 0, 0]],
+])
+angles_batch(triplets)                  # → [90., 180.]
+```
+
+Pose-aware helpers and the aggregate analyzer:
+
+```python
+from src.biomechanics import (
+    PostureAnalyzer,
+    neck_angle, shoulder_slope, torso_inclination,
+)
+
+# Compute one metric ad hoc:
+neck_angle(pose)                        # → e.g. 168.4 (or NaN if occluded)
+
+# Or get all three at once:
+analyzer = PostureAnalyzer(visibility_threshold=0.5)
+metrics = analyzer.analyze(pose)
+print(metrics.neck_angle, metrics.shoulder_slope, metrics.torso_inclination)
+```
+
+All helpers return `math.nan` when required landmarks fall below the
+visibility threshold or when `pose is None`, so they're safe to call every
+frame without try/except.
 
 ## Performance notes
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 
+from .biomechanics import PostureMetrics
 from .landmarks import POSE_CONNECTIONS, Pose
 
 Color = Tuple[int, int, int]
@@ -63,10 +65,30 @@ class PoseRenderer:
         return frame
 
     def draw_fps(self, frame: np.ndarray, fps: float) -> np.ndarray:
-        text = f"FPS: {fps:5.1f}"
-        origin = (12, 32)
+        return self._draw_hud_text(frame, f"FPS: {fps:5.1f}", origin=(12, 32))
+
+    def draw_metrics(self, frame: np.ndarray, metrics: PostureMetrics) -> np.ndarray:
+        lines = (
+            f"Neck:     {self._fmt(metrics.neck_angle)}",
+            f"Shoulder: {self._fmt(metrics.shoulder_slope)}",
+            f"Torso:    {self._fmt(metrics.torso_inclination)}",
+        )
+        for i, line in enumerate(lines):
+            self._draw_hud_text(frame, line, origin=(12, 64 + i * 28), scale=0.65)
+        return frame
+
+    @staticmethod
+    def _fmt(value: float) -> str:
+        return "  --" if math.isnan(value) else f"{value:6.1f} deg"
+
+    def _draw_hud_text(
+        self,
+        frame: np.ndarray,
+        text: str,
+        origin: Tuple[int, int],
+        scale: float = 0.8,
+    ) -> np.ndarray:
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.8
         # Black outline first for legibility on bright backgrounds.
         cv2.putText(frame, text, origin, font, scale, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(frame, text, origin, font, scale, self._hud_color, 2, cv2.LINE_AA)

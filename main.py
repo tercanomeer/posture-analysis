@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 
 import cv2
 
+from src.biomechanics import PostureAnalyzer, PostureMetrics
 from src.camera import Webcam
 from src.detector import PoseDetector
 from src.fps import FPSCounter
@@ -43,6 +45,23 @@ def _coerce_source(value):
         return value
 
 
+def _fmt_deg(v: float) -> str:
+    return "   -- " if math.isnan(v) else f"{v:6.1f}"
+
+
+def _print_metrics(metrics: PostureMetrics, fps: float) -> None:
+    line = (
+        f"\rNeck: {_fmt_deg(metrics.neck_angle)}°  "
+        f"Shoulder: {_fmt_deg(metrics.shoulder_slope)}°  "
+        f"Torso: {_fmt_deg(metrics.torso_inclination)}°  "
+        f"FPS: {fps:5.1f}"
+    )
+    # \r so an interactive terminal sees one self-updating line; flush so
+    # consumers reading the pipe (e.g. background tasks) see each tick promptly.
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
 def main() -> int:
     args = parse_args()
     source = _coerce_source(args.source)
@@ -52,6 +71,7 @@ def main() -> int:
 
     fps = FPSCounter()
     extractor = LandmarkExtractor()
+    analyzer = PostureAnalyzer()
     renderer = PoseRenderer()
 
     with Webcam(source=source, width=args.width, height=args.height) as cam, \
@@ -62,8 +82,13 @@ def main() -> int:
 
             raw = detector.detect(frame)
             pose = extractor.extract(raw.landmarks, raw.image_size)
+            metrics = analyzer.analyze(pose)
+            current_fps = fps.tick()
+
             renderer.draw_skeleton(frame, pose)
-            renderer.draw_fps(frame, fps.tick())
+            renderer.draw_fps(frame, current_fps)
+            renderer.draw_metrics(frame, metrics)
+            _print_metrics(metrics, current_fps)
 
             cv2.imshow(WINDOW_NAME, frame)
             if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
@@ -71,6 +96,7 @@ def main() -> int:
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
 
+    sys.stdout.write("\n")
     cv2.destroyAllWindows()
     return 0
 
