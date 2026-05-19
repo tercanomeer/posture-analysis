@@ -15,6 +15,7 @@ from src.fps import FPSCounter
 from src.landmarks import LandmarkExtractor
 from src.models import MODEL_URLS, ensure_pose_model
 from src.renderer import PoseRenderer
+from src.smoother import LandmarkSmoother
 
 WINDOW_NAME = "Posture Analysis"
 QUIT_KEYS = {ord("q"), ord("Q"), 27}  # 27 == ESC
@@ -37,6 +38,21 @@ def parse_args() -> argparse.Namespace:
         help="Directory used to cache downloaded .task model files.",
     )
     parser.add_argument("--no-mirror", action="store_true", help="Disable horizontal flip.")
+    parser.add_argument(
+        "--smoothing-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "EMA weight applied to the newest landmark sample (default: 0.5). "
+            "1.0 disables smoothing; lower values smooth more aggressively."
+        ),
+    )
+    parser.add_argument(
+        "--visibility-alpha",
+        type=float,
+        default=0.7,
+        help="EMA weight for landmark visibility scores (default: 0.7).",
+    )
     return parser.parse_args()
 
 
@@ -74,6 +90,10 @@ def main() -> int:
 
     fps = FPSCounter()
     extractor = LandmarkExtractor()
+    smoother = LandmarkSmoother(
+        alpha=args.smoothing_alpha,
+        visibility_alpha=args.visibility_alpha,
+    )
     analyzer = PostureAnalyzer()
     classifier = PostureClassifier()
     renderer = PoseRenderer()
@@ -87,6 +107,7 @@ def main() -> int:
 
             raw = detector.detect(frame)
             pose = extractor.extract(raw.landmarks, raw.image_size)
+            pose = smoother.smooth(pose)
             metrics = analyzer.analyze(pose)
             assessment = classifier.classify(metrics)
             current_fps = fps.tick()
