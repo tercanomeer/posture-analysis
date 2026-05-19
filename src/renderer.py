@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from mediapipe.tasks.python.vision import PoseLandmarksConnections
 
-from .detector import PoseResult
+from .landmarks import POSE_CONNECTIONS, Pose
 
 Color = Tuple[int, int, int]
 
-_POSE_CONNECTIONS: tuple[tuple[int, int], ...] = tuple(
-    (c.start, c.end) for c in PoseLandmarksConnections.POSE_LANDMARKS
-)
-
 
 class PoseRenderer:
-    """Draws pose skeleton and HUD elements onto frames in place."""
+    """Draws a ``Pose`` skeleton and HUD elements onto frames in place.
+
+    Independent of MediaPipe — depends only on the ``landmarks`` module.
+    """
 
     def __init__(
         self,
@@ -34,18 +32,18 @@ class PoseRenderer:
         self._visibility_threshold = visibility_threshold
         self._hud_color = hud_color
 
-    def draw_skeleton(self, frame: np.ndarray, result: PoseResult) -> np.ndarray:
-        if not result.detected:
+    def draw_skeleton(self, frame: np.ndarray, pose: Optional[Pose]) -> np.ndarray:
+        if pose is None:
             return frame
-        h, w = frame.shape[:2]
-        landmarks = result.landmarks
-        # Pre-project once; reuse for both edges and joints.
-        points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-        vis = [getattr(lm, "visibility", 1.0) for lm in landmarks]
+        points = pose.pixels  # cached projection
+        landmarks = pose.landmarks
         threshold = self._visibility_threshold
 
-        for start, end in _POSE_CONNECTIONS:
-            if vis[start] < threshold or vis[end] < threshold:
+        for start, end in POSE_CONNECTIONS:
+            if (
+                landmarks[start].visibility < threshold
+                or landmarks[end].visibility < threshold
+            ):
                 continue
             cv2.line(
                 frame,
@@ -56,11 +54,12 @@ class PoseRenderer:
                 cv2.LINE_AA,
             )
 
-        for (x, y), v in zip(points, vis):
-            if v < threshold:
+        for (x, y), lm in zip(points, landmarks):
+            if lm.visibility < threshold:
                 continue
-            cv2.circle(frame, (x, y), self._landmark_radius, self._landmark_color, -1, cv2.LINE_AA)
-
+            cv2.circle(
+                frame, (x, y), self._landmark_radius, self._landmark_color, -1, cv2.LINE_AA
+            )
         return frame
 
     def draw_fps(self, frame: np.ndarray, fps: float) -> np.ndarray:

@@ -8,6 +8,7 @@ import cv2
 from src.camera import Webcam
 from src.detector import PoseDetector
 from src.fps import FPSCounter
+from src.landmarks import LandmarkExtractor
 from src.models import MODEL_URLS, ensure_pose_model
 from src.renderer import PoseRenderer
 
@@ -50,6 +51,7 @@ def main() -> int:
     model_path = ensure_pose_model(args.model, args.models_dir)
 
     fps = FPSCounter()
+    extractor = LandmarkExtractor()
     renderer = PoseRenderer()
 
     with Webcam(source=source, width=args.width, height=args.height) as cam, \
@@ -58,8 +60,9 @@ def main() -> int:
             if mirror:
                 frame = cv2.flip(frame, 1)
 
-            result = detector.detect(frame)
-            renderer.draw_skeleton(frame, result)
+            raw = detector.detect(frame)
+            pose = extractor.extract(raw.landmarks, raw.image_size)
+            renderer.draw_skeleton(frame, pose)
             renderer.draw_fps(frame, fps.tick())
 
             cv2.imshow(WINDOW_NAME, frame)

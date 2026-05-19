@@ -1,22 +1,25 @@
 # posture-analysis
 
 Real-time human pose detection from a webcam feed, built on MediaPipe + OpenCV.
-Draws a 33-point skeleton overlay and a live FPS counter.
+Produces structured, framework-agnostic landmark objects (with optional
+body-relative normalization) and renders a skeleton overlay with a live FPS
+counter.
 
 ## File structure
 
 ```
 posture-analysis/
-├── main.py              # Entry point — argparse, capture/detect/render loop
+├── main.py              # Entry point — argparse, capture/detect/extract/render loop
 ├── requirements.txt
-├── .gitignore
 ├── README.md
+├── .gitignore
 ├── models/              # Auto-populated cache for downloaded .task files (gitignored)
 └── src/
     ├── __init__.py
     ├── camera.py        # Webcam capture (context-managed, low-latency defaults)
     ├── detector.py      # PoseDetector — MediaPipe Tasks PoseLandmarker wrapper
-    ├── renderer.py      # PoseRenderer — skeleton overlay + HUD
+    ├── landmarks.py     # PoseLandmark enum, Landmark, Pose, LandmarkExtractor, POSE_CONNECTIONS
+    ├── renderer.py      # PoseRenderer — skeleton overlay + HUD (MediaPipe-free)
     ├── fps.py           # FPSCounter — EMA-smoothed frame rate
     └── models.py        # ensure_pose_model — auto-downloads .task files
 ```
@@ -35,8 +38,8 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Grant your terminal camera access on first run (macOS: *System Settings → Privacy
-& Security → Camera*).
+Grant your terminal camera access on first run (macOS: *System Settings →
+Privacy & Security → Camera*).
 
 ## Execution
 
@@ -46,86 +49,126 @@ python main.py
 
 Useful flags:
 
-| Flag                | Default | Description                                          |
-| ------------------- | ------- | ---------------------------------------------------- |
-| `--source`          | `0`     | Camera index or video file path                      |
-| `--width`           | `1280`  | Capture width                                        |
-| `--height`          | `720`   | Capture height                                       |
-| `--model`           | `full`  | Pose model variant: `lite`, `full`, `heavy`          |
-| `--models-dir`      | `models`| Where to cache downloaded `.task` files              |
-| `--no-mirror`       | off     | Disable horizontal flip of the webcam feed           |
-
-The first run downloads the chosen `.task` model (~6 MB lite, ~9 MB full, ~30 MB
-heavy) into `models/`. Subsequent runs reuse the cached file.
+| Flag           | Default  | Description                                  |
+| -------------- | -------- | -------------------------------------------- |
+| `--source`     | `0`      | Camera index or video file path              |
+| `--width`      | `1280`   | Capture width                                |
+| `--height`     | `720`    | Capture height                               |
+| `--model`      | `full`   | `lite` / `full` / `heavy`                    |
+| `--models-dir` | `models` | Where to cache downloaded `.task` files      |
+| `--no-mirror`  | off      | Disable horizontal flip of the webcam feed   |
 
 Press **Q** or **Esc** to quit; closing the window also exits cleanly.
 
 ## Architecture
 
-The pipeline is split into single-responsibility modules so each piece is
-independently testable and replaceable.
+The pipeline is split into single-responsibility stages so each piece is
+independently testable, replaceable, and reusable.
 
 ```
-   ┌──────────┐    BGR frame    ┌────────────┐    PoseResult    ┌────────────┐
-   │  Webcam  │ ──────────────► │PoseDetector│ ───────────────► │PoseRenderer│ ──► imshow
-   └──────────┘                 └────────────┘                  └────────────┘
-                                                                       ▲
-                                                                       │ fps
-                                                                  ┌─────────┐
-                                                                  │FPSCounter│
-                                                                  └─────────┘
+   ┌────────┐  BGR frame   ┌──────────┐  RawPoseResult   ┌──────────────────┐  Pose   ┌────────────┐
+   │ Webcam │ ───────────► │ Detector │ ───────────────► │ LandmarkExtractor│ ──────► │ Renderer   │ ──► imshow
+   └────────┘              └──────────┘                  └──────────────────┘         └────────────┘
+                                                                  │
+                                                                  ▼
+                                                          downstream analytics
+                                                          (e.g. body_normalized())
 ```
+
+The key architectural rule: **MediaPipe lives behind the detector/extractor
+boundary**. The renderer and any analytics modules consume `Pose` objects
+defined in `src/landmarks.py` and never import `mediapipe` directly. Swapping
+the detector for a different pose backend would require no changes elsewhere.
 
 ### `src/camera.py` — `Webcam`
 Context-managed `cv2.VideoCapture` wrapper. Sets `CAP_PROP_BUFFERSIZE=1` so the
 loop always processes the freshest frame instead of draining a backlog under
-load. Exposes a `frames()` generator and a single-shot `read()` for flexibility.
+load.
 
-### `src/detector.py` — `PoseDetector`, `PoseResult`
-Wraps `mediapipe.tasks.vision.PoseLandmarker` in `RunningMode.VIDEO` (synchronous
-per-frame inference with internal temporal smoothing). Converts BGR → RGB once
-per frame, wraps it in `mp.Image`, and supplies a monotonic millisecond
-timestamp (required by VIDEO mode). The `PoseResult` dataclass hides the
-MediaPipe-specific shape so downstream consumers see a simple
-`landmarks: list | None` plus a `detected` flag.
+### `src/detector.py` — `PoseDetector`, `RawPoseResult`
+Wraps `mediapipe.tasks.vision.PoseLandmarker` in `RunningMode.VIDEO`
+(synchronous per-frame inference with internal temporal smoothing). Returns
+`RawPoseResult`, which carries the raw MediaPipe landmark list plus the source
+image size. This type exists only at the MediaPipe boundary — downstream
+modules consume the structured `Pose` produced by the extractor.
 
-Tunables: `model_path`, `num_poses`, the three confidence thresholds.
+### `src/landmarks.py` — landmark processing
+The reusable structured-output layer.
+
+- **`PoseLandmark`** — `IntEnum` of all 33 named MediaPipe pose joints
+  (`NOSE`, `LEFT_SHOULDER`, `RIGHT_HIP`, …) for self-documenting access.
+- **`Landmark`** — `@dataclass(frozen=True, slots=True)` value type carrying
+  `x`, `y`, `z` (image-normalized) and `visibility`. `slots=True` keeps
+  per-frame allocations tight.
+- **`Pose`** — ordered collection of 33 `Landmark`s plus the originating image
+  size. Supports `len()`, iteration, integer indexing, *and* `pose[PoseLandmark.LEFT_HIP]`
+  /  `pose.get(PoseLandmark.LEFT_HIP)`. Pixel projections are computed lazily
+  on first access and cached for O(1) reuse within a frame.
+- **`Pose.body_normalized()`** — returns a tuple of `Landmark`s recentered at
+  the hip midpoint and scaled by torso length. Output is translation- and
+  scale-invariant, ideal for posture metrics, classifiers, or temporal
+  comparisons. A `min_scale` floor guards against degenerate torsos when the
+  subject is partially out of frame.
+- **`LandmarkExtractor`** — stateless converter from `RawPoseResult.landmarks`
+  → `Pose`. Returns `None` when no pose was detected.
+- **`POSE_CONNECTIONS`** — the 35-edge pose topology, extracted once from
+  MediaPipe at module load and re-exported as a plain tuple so consumers
+  (renderer, custom overlays) don't need to import MediaPipe.
 
 ### `src/renderer.py` — `PoseRenderer`
-Stateless drawing of skeleton + HUD onto frames *in place* (no allocations per
-frame). Edges come from `PoseLandmarksConnections.POSE_LANDMARKS`; each landmark
-is visibility-gated against a configurable threshold so noisy off-screen joints
-don't get drawn. FPS text is rendered twice — black stroke, then colored fill —
-for legibility on bright backgrounds.
+Stateless drawing of skeleton + HUD onto frames *in place*. Imports only from
+`landmarks.py`. Uses the cached `pose.pixels` projection and visibility-gates
+both edges and joints. FPS text is rendered twice (black stroke, then colored
+fill) for legibility on bright backgrounds.
 
 ### `src/fps.py` — `FPSCounter`
 Exponential-moving-average frame-rate estimator over `time.perf_counter()`
-deltas. Smoothing factor (`alpha`) trades responsiveness for stability; default
-0.1 produces a readable HUD without per-frame jitter.
+deltas. The `alpha` weight trades responsiveness for stability; default `0.1`
+produces a readable HUD without per-frame jitter.
 
 ### `src/models.py` — `ensure_pose_model`
-Lazy downloader for the `.task` model files. Uses `certifi`'s CA bundle for SSL
-verification (python.org macOS builds ship without trusted roots). Writes to a
-`.part` temp file and atomically renames on success so an interrupted download
-never leaves a corrupt model on disk.
+Lazy downloader for the pose `.task` files. Routes downloads through
+`certifi`'s CA bundle because python.org's macOS builds ship without a trust
+store. Writes to a `.part` temp file and atomically renames on success so an
+interrupted download never leaves a corrupt model on disk.
 
 ### `main.py` — composition root
 Parses CLI args, ensures the model file, then composes the four collaborators
 inside a single `with` block so camera and detector are deterministically
-released on exit (including on Ctrl-C). The loop is intentionally
-allocation-light: capture → mirror → detect → draw → show → key check.
+released on exit (including on Ctrl-C). The per-frame loop is intentionally
+allocation-light: capture → mirror → detect → extract → draw → show → key check.
+
+## Using the landmark system in your own code
+
+```python
+from src.detector import PoseDetector
+from src.landmarks import LandmarkExtractor, PoseLandmark
+from src.models import ensure_pose_model
+
+extractor = LandmarkExtractor()
+with PoseDetector(model_path=str(ensure_pose_model("full"))) as det:
+    raw = det.detect(bgr_frame)
+    pose = extractor.extract(raw.landmarks, raw.image_size)
+    if pose is not None:
+        # Named access for self-documenting analytics:
+        left_shoulder = pose[PoseLandmark.LEFT_SHOULDER]
+        right_hip = pose[PoseLandmark.RIGHT_HIP]
+
+        # Translation/scale-invariant features for ML or rules-based posture analysis:
+        features = pose.body_normalized()
+```
 
 ## Performance notes
 
-- **Single BGR→RGB conversion** per frame; the same array is wrapped in
-  `mp.Image` directly.
-- **`CAP_PROP_BUFFERSIZE = 1`** keeps end-to-end latency low at the cost of
-  occasional dropped frames under back-pressure — the right trade-off for a
-  live HUD.
+- **Single BGR→RGB conversion** per frame; the array is wrapped in `mp.Image`
+  with no extra copy.
+- **`CAP_PROP_BUFFERSIZE = 1`** trades occasional dropped frames for low
+  end-to-end latency — the right trade-off for a live HUD.
 - **VIDEO running mode** beats `IMAGE` mode in cost (it reuses tracker state)
   and beats `LIVE_STREAM` in simplicity (sync return, no callback marshalling).
-- **Pre-projected landmark points** are reused for edges and joints inside
-  `draw_skeleton` so each landmark is converted to pixel space exactly once.
-- **Model choice**: start with `--model lite` on CPU-only machines; `full`
-  (default) is a good balance on Apple Silicon / discrete GPUs; `heavy` is for
-  offline/quality-first work.
+- **Lazy pixel cache** in `Pose.pixels` means each landmark is projected to
+  pixel space exactly once per frame and reused across edge + joint drawing.
+- **`slots=True`** on the `Landmark` dataclass keeps the per-frame 33-landmark
+  allocation compact (no per-instance `__dict__`).
+- **Model choice**: `--model lite` for low-end CPUs, `full` (default) for
+  Apple Silicon / discrete GPUs, `heavy` for offline/quality-first work.

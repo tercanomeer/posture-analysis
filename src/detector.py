@@ -12,10 +12,15 @@ from mediapipe.tasks.python import vision as mp_vision
 
 
 @dataclass(frozen=True)
-class PoseResult:
-    """One pose's landmarks in normalized image coordinates, or None."""
+class RawPoseResult:
+    """MediaPipe-native pose output for a single frame.
+
+    Exists only at the detector boundary. Other layers should consume a
+    ``landmarks.Pose`` produced by ``LandmarkExtractor``.
+    """
 
     landmarks: Optional[List]
+    image_size: tuple[int, int]
 
     @property
     def detected(self) -> bool:
@@ -23,7 +28,7 @@ class PoseResult:
 
 
 class PoseDetector:
-    """MediaPipe Tasks PoseLandmarker wrapper running in VIDEO mode."""
+    """Thin wrapper around MediaPipe Tasks ``PoseLandmarker`` (VIDEO mode)."""
 
     def __init__(
         self,
@@ -46,14 +51,14 @@ class PoseDetector:
         # VIDEO mode requires monotonically increasing millisecond timestamps.
         self._t0 = time.perf_counter()
 
-    def detect(self, bgr_frame: np.ndarray) -> PoseResult:
+    def detect(self, bgr_frame: np.ndarray) -> RawPoseResult:
+        h, w = bgr_frame.shape[:2]
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         ts_ms = int((time.perf_counter() - self._t0) * 1000)
         result = self._landmarker.detect_for_video(mp_image, ts_ms)
-        if not result.pose_landmarks:
-            return PoseResult(landmarks=None)
-        return PoseResult(landmarks=result.pose_landmarks[0])
+        landmarks = result.pose_landmarks[0] if result.pose_landmarks else None
+        return RawPoseResult(landmarks=landmarks, image_size=(w, h))
 
     def close(self) -> None:
         self._landmarker.close()
